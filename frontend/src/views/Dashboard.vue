@@ -13,30 +13,58 @@
         <button class="btn btn-primary" @click="enqueueSelected">
           加入队列
         </button>
-        <button class="btn" @click="store.clearSelection()">
-          取消选择
-        </button>
+        <button class="btn" @click="store.clearSelection()">取消选择</button>
       </div>
+    </div>
+
+    <div class="queue-status-bar">
+      <span class="queue-stat">
+        <span class="queue-stat-label">Worker:</span>
+        <span class="worker-dots">
+          <span
+            v-for="i in store.queueStats.maxConcurrency"
+            :key="i"
+            class="worker-dot"
+            :class="{ active: i <= store.queueStats.active }"
+          ></span>
+        </span>
+        <span class="queue-stat-value"
+          >{{ store.queueStats.active }}/{{
+            store.queueStats.maxConcurrency
+          }}</span
+        >
+      </span>
+      <span class="queue-stat">
+        <span class="queue-stat-label">排队中:</span>
+        <span class="queue-stat-value">{{ store.queueStats.queued }}</span>
+      </span>
+      <span class="queue-stat" v-if="store.processingTasks.length > 0">
+        <span class="queue-stat-label">执行中任务:</span>
+        <span class="queue-stat-value"
+          >#{{ store.processingTasks.map((t) => t.id).join(", #") }}</span
+        >
+      </span>
     </div>
 
     <div v-if="store.loading" class="loading">加载中...</div>
 
     <div class="kanban">
-      <div
-        v-for="status in statusColumns"
-        :key="status"
-        class="kanban-column"
-      >
+      <div v-for="status in statusColumns" :key="status" class="kanban-column">
         <div class="column-header">
           <span class="column-title">
-            <span class="status-dot" :style="{ background: StatusColors[status] }"></span>
+            <span
+              class="status-dot"
+              :style="{ background: StatusColors[status] }"
+            ></span>
             {{ StatusLabels[status] }}
           </span>
-          <span class="column-count">{{ store.tasksByStatus[status].length }}</span>
+          <span class="column-count">{{
+            (store.tasksByStatus[status] || []).length
+          }}</span>
         </div>
 
         <div
-          v-for="task in store.tasksByStatus[status]"
+          v-for="task in store.tasksByStatus[status] || []"
           :key="task.id"
           class="task-card"
           :class="{ selected: store.selectedTaskIds.includes(task.id) }"
@@ -50,12 +78,40 @@
             <span class="tag">{{ CameraLabels[task.cameraAngle] }}</span>
           </div>
           <div v-if="task.status === 'PROCESSING'" class="progress-bar">
-            <div class="progress-fill" :style="{ width: task.progress + '%' }"></div>
+            <div
+              class="progress-fill"
+              :style="{ width: task.progress + '%' }"
+            ></div>
+          </div>
+          <div
+            v-if="task.status === 'PROCESSING'"
+            style="
+              font-size: 0.7rem;
+              color: #3b82f6;
+              margin-top: 0.25rem;
+              text-align: right;
+            "
+          >
+            {{ task.progress }}%
           </div>
           <div v-if="task.reviews.length > 0" style="margin-top: 0.5rem">
             <span style="font-size: 0.7rem; color: #64748b">
               ⭐ {{ task.reviews[0].rating }}
             </span>
+          </div>
+          <div
+            v-if="task.status === 'QUEUED' || task.status === 'PROCESSING'"
+            class="task-card-actions"
+          >
+            <button
+              class="btn-cancel"
+              :disabled="store.cancellingTaskIds.has(task.id)"
+              @click.stop="cancelTask(task.id)"
+            >
+              {{
+                store.cancellingTaskIds.has(task.id) ? "取消中..." : "✕ 取消"
+              }}
+            </button>
           </div>
         </div>
       </div>
@@ -64,25 +120,39 @@
 </template>
 
 <script setup lang="ts">
-import { useStore } from '../store'
-import { StatusLabels, StatusColors, SceneLabels, CameraLabels } from '../types'
-import type { Task, TaskStatus } from '../types'
+import { useStore } from "../store";
+import {
+  StatusLabels,
+  StatusColors,
+  SceneLabels,
+  CameraLabels,
+} from "../types";
+import type { Task, TaskStatus } from "../types";
 
-const store = useStore()
+const store = useStore();
 
-const statusColumns: TaskStatus[] = ['PENDING', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED']
+const statusColumns: TaskStatus[] = [
+  "PENDING",
+  "QUEUED",
+  "PROCESSING",
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+];
 
 function handleTaskClick(task: Task, event: MouseEvent) {
-  if (task.status === 'PENDING') {
-    store.toggleTaskSelection(task.id)
-  } else if (!event.ctrlKey && !event.metaKey) {
-    // Double click handled by @dblclick
+  if (task.status === "PENDING") {
+    store.toggleTaskSelection(task.id);
   }
 }
 
 async function enqueueSelected() {
-  await store.enqueueTasks(store.selectedTaskIds)
-  store.clearSelection()
+  await store.enqueueTasks(store.selectedTaskIds);
+  store.clearSelection();
+}
+
+async function cancelTask(taskId: number) {
+  await store.cancelTask(taskId);
 }
 </script>
 
