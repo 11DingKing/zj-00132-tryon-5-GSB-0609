@@ -59,6 +59,10 @@ model Task {
   createdAt       DateTime @default(now())
   isReshoot       Boolean  @default(false)
   reshootGroupId  String?
+  retryCount      Int      @default(0)
+  maxRetries      Int      @default(3)
+  errorMessage    String?
+  cancelledAt     DateTime?
   
   model           Model    @relation(fields: [modelId], references: [id], onDelete: Cascade)
   sku             SKU      @relation(fields: [skuId], references: [id], onDelete: Cascade)
