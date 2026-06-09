@@ -1,10 +1,19 @@
-const prisma = require('../shared/prisma');
-const { enqueueTask } = require('../queues/taskQueue');
-const { createAuditLog } = require('./auditLogService');
-const { serializeTasks, serializeTask } = require('../helpers/serializer');
+const prisma = require("../shared/prisma");
+const { enqueueTask, cancelTask } = require("../queues/taskQueue");
+const { createAuditLog } = require("./auditLogService");
+const { serializeTasks, serializeTask } = require("../helpers/serializer");
 
-async function createTasks(modelIds, skuIds, scenes, cameraAngles, lightings) {
+async function createTasks(
+  modelIds,
+  skuIds,
+  scenes,
+  cameraAngles,
+  lightings,
+  options = {},
+) {
   const tasks = [];
+  const maxRetries = options.maxRetries ?? 3;
+
   for (const modelId of modelIds) {
     for (const skuId of skuIds) {
       for (const scene of scenes) {
@@ -16,7 +25,8 @@ async function createTasks(modelIds, skuIds, scenes, cameraAngles, lightings) {
               scene,
               cameraAngle,
               lighting,
-              status: 'PENDING',
+              status: "PENDING",
+              maxRetries,
               originalImageUrl: `https://picsum.photos/seed/orig${Date.now()}${tasks.length}/800/1000`,
             });
           }
@@ -26,31 +36,65 @@ async function createTasks(modelIds, skuIds, scenes, cameraAngles, lightings) {
   }
 
   const createdTasks = await prisma.$transaction(
-    tasks.map(task => prisma.task.create({ data: task }))
+    tasks.map((task) => prisma.task.create({ data: task })),
   );
 
-  await createAuditLog(1, 'CREATE_TASKS', `Created ${createdTasks.length} tasks`);
+  await createAuditLog(
+    1,
+    "CREATE_TASKS",
+    `Created ${createdTasks.length} tasks`,
+  );
 
   return createdTasks;
 }
 
 async function enqueueTasks(taskIds) {
-  await prisma.task.updateMany({
-    where: { id: { in: taskIds }, status: 'PENDING' },
-    data: { status: 'QUEUED', queuedAt: new Date() },
+  const tasks = await prisma.task.findMany({
+    where: { id: { in: taskIds }, status: "PENDING" },
+    select: { id: true },
   });
 
-  taskIds.forEach(id => enqueueTask(id));
+  const validTaskIds = tasks.map((t) => t.id);
 
-  await createAuditLog(1, 'ENQUEUE_TASKS', `Enqueued ${taskIds.length} tasks`);
+  if (validTaskIds.length === 0) {
+    return { success: true, queued: 0 };
+  }
 
-  return { success: true, queued: taskIds.length };
+  await prisma.task.updateMany({
+    where: { id: { in: validTaskIds } },
+    data: { status: "QUEUED", queuedAt: new Date() },
+  });
+
+  validTaskIds.forEach((id) => enqueueTask(id));
+
+  await createAuditLog(
+    1,
+    "ENQUEUE_TASKS",
+    `Enqueued ${validTaskIds.length} tasks`,
+  );
+
+  return { success: true, queued: validTaskIds.length };
+}
+
+async function cancelTasks(taskIds) {
+  const results = [];
+
+  for (const taskId of taskIds) {
+    const success = await cancelTask(taskId);
+    if (success) {
+      results.push(taskId);
+    }
+  }
+
+  await createAuditLog(1, "CANCEL_TASKS", `Cancelled ${results.length} tasks`);
+
+  return { success: true, cancelled: results.length, taskIds: results };
 }
 
 async function getAllTasks() {
   const tasks = await prisma.task.findMany({
     include: { model: true, sku: true, reviews: true },
-    orderBy: { createdAt: 'desc' },
+    orderBy: { createdAt: "desc" },
   });
   return serializeTasks(tasks);
 }
@@ -70,13 +114,14 @@ async function getReshootCandidates(taskId) {
   return prisma.reshootCandidate.findMany({
     where: { parentTaskId: taskId },
     include: { task: true },
-    orderBy: { createdAt: 'asc' },
+    orderBy: { createdAt: "asc" },
   });
 }
 
 module.exports = {
   createTasks,
   enqueueTasks,
+  cancelTasks,
   getAllTasks,
   getTaskById,
   getReshootCandidates,
