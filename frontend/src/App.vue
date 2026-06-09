@@ -20,14 +20,14 @@ import { onMounted, onUnmounted } from 'vue'
 import { useStore } from './store'
 
 const store = useStore()
-let pollInterval: number
+let stopPolling: (() => void) | null = null
 
 onMounted(async () => {
   await store.fetchAll()
-  pollInterval = store.startPolling()
+  stopPolling = store.startPolling()
 })
 
 onUnmounted(() => {
-  if (pollInterval) clearInterval(pollInterval)
+  if (stopPolling) stopPolling()
 })
 </script>
