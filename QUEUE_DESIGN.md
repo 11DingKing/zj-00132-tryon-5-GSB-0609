@@ -1,23 +1,38 @@
 # 并发调度模型说明
 
-## 概览
+## 1. Worker 并发调度
 
-任务队列从单 worker 串行模型升级为多 worker 并发模型，支持可配置并发数、任务取消（含运行中中止）、指数退避自动重试。
-
-## Worker 调度模型
+### 核心数据结构
 
 ```
-enqueue(taskId) → queue[] → _schedule() → _runWorker(taskId)
-                                    ↑              |
-                                    └── finally() ─┘
+TaskQueue {
+  queue[]            // 等待队列，FIFO
+  activeWorkers      // 当前运行中的 worker 计数
+  cancelledSet       // 已取消任务 ID 集合（防止被重新拾起）
+  abortControllers   // Map<taskId, AbortController>（运行中任务的中止控制器）
+}
 ```
 
-- **入队**：`enqueue()` 将任务推入内存队列 `queue[]`，立即调用 `_schedule()`
-- **调度**：`_schedule()` 循环检查 `activeWorkers < CONCURRENCY`，只要有空位就从队列头部取出任务启动 worker
-- **释放**：worker 完成（无论成功/失败/取消）后在 `finally` 中递减 `activeWorkers` 并再次调用 `_schedule()`，形成级联调度
-- **严格上限**：`activeWorkers` 在 worker 启动前递增、结束后递减，保证同一时刻运行中的 worker 数量 ≤ `CONCURRENCY`
+### Worker 取任务流程
 
-### 配置项
+```
+enqueue(taskId)
+  ├─ 检查 cancelledSet，已取消则拒绝入队
+  ├─ 去重检查，已在队列则跳过
+  ├─ 推入 queue[]
+  └─ 调用 _schedule()
+        │
+        └─ while (activeWorkers < CONCURRENCY && queue.length > 0)
+             ├─ 从 queue 头部取出 entry
+             ├─ 若 entry.taskId 在 cancelledSet 中，跳过，继续取下一个
+             ├─ activeWorkers++
+             └─ 启动 _runWorker(taskId).finally(() => { activeWorkers--; _schedule() })
+                                                    ↑ 级联调度：worker 结束后自动填补空位
+```
+
+**严格并发上限保证**：`activeWorkers` 在 worker 启动前递增、在 `finally` 中递减，while 循环条件保证 `activeWorkers ≤ CONCURRENCY`。
+
+### 配置项（环境变量）
 
 | 环境变量 | 默认值 | 说明 |
 |---------|-------|------|
@@ -25,74 +40,106 @@ enqueue(taskId) → queue[] → _schedule() → _runWorker(taskId)
 | `QUEUE_MAX_RETRIES` | 3 | 失败最大重试次数 |
 | `QUEUE_BASE_RETRY_DELAY` | 2000ms | 重试退避基础延迟 |
 
-## 任务取消机制
+## 2. 取消中止机制
 
-取消操作通过 `POST /api/tasks/:id/cancel` 触发，根据任务当前状态分三种情况处理：
+取消操作通过 `POST /api/tasks/:id/cancel` 触发，全部逻辑封装在 `TaskQueue.cancelTask()` 内。
 
-### 1. 排队中（QUEUED，在内存队列中）
-- 从 `queue[]` 中移除该条目
-- 数据库状态更新为 `CANCELLED`
+### 取消执行步骤（按顺序）
 
-### 2. 执行中（PROCESSING，worker 正在运行）
-- 通过 `AbortController` 机制中止：
-  - 每个运行中的任务在 `_runWorker` 入口创建 `AbortController`，存入 `abortControllers` Map
-  - 取消时调用 `controller.abort()`
-  - `_executeTask` 中每个步骤的 `setTimeout` 都监听了 `abort` 事件，收到信号后 `clearTimeout` 并 reject
-  - worker catch 到 `CANCELLED` 错误后检查 `signal.aborted`，跳过重试逻辑直接退出
-- 数据库状态更新为 `CANCELLED`
+1. **加入 cancelledSet**：`cancelledSet.add(taskId)` —— 这是第一道防线，后续所有路径都会检查此集合
+2. **从内存队列移除**：若任务在 `queue[]` 中排队，直接 splice 移除
+3. **中止运行中 worker**：若任务有 `AbortController`（正在 PROCESSING），调用 `controller.abort()`
+4. **更新数据库**：将状态设为 `CANCELLED`，带 `.catch(() => {})` 容错
 
-### 3. 待入队（PENDING，尚未 enqueue）
-- 直接在数据库中将状态更新为 `CANCELLED`
+### Worker 侧如何响应取消
 
-## 重试退避策略
+**_executeTask 中每个进度 step 之间**：
+- 检查 `cancelledSet.has(taskId)` —— 内存级快速判断
+- 检查 `signal.aborted` —— AbortController 信号
+- `_sleep()` 内部监听 `signal.abort` 事件，收到后 `clearTimeout` 并 reject
+- 任一条件满足立即抛出 `CANCELLED` 错误
+
+**_runWorker 的 catch 块**：
+- 检查 `cancelledSet.has(taskId) || signal.aborted` → 直接 return，不进入重试逻辑
+
+**写入 COMPLETED 前的二次校验**：
+- 先检查 `cancelledSet` 和 `signal.aborted`
+- 再从数据库读取最新状态，若已是 `CANCELLED` 则放弃写入 COMPLETED
+- 这解决了取消和完成之间的竞态条件
+
+**cancelledSet 防复活**：
+- `enqueue()` 入口检查 cancelledSet，已取消任务无法重新入队
+- `_schedule()` 取任务时跳过 cancelledSet 中的任务
+- 重试退避等待后再次检查 cancelledSet，防止等待期间被取消的任务被重新拾起
+
+## 3. 重试退避策略
+
+### 退避公式
 
 ```
 delay = BASE_RETRY_DELAY × 2^retryCount
 ```
 
-| 重试次数 | 退避延迟（BASE=2000ms） |
-|---------|----------------------|
-| 第1次重试 | 2000ms |
-| 第2次重试 | 4000ms |
-| 第3次重试 | 8000ms |
+| 重试次数 | retryCount 值 | 退避延迟（BASE=2000ms） |
+|---------|-------------|----------------------|
+| 第1次重试 | 0 → 1 | 2000ms |
+| 第2次重试 | 1 → 2 | 4000ms |
+| 第3次重试 | 2 → 3 | 8000ms |
 
-流程：
-1. 任务执行失败，检查 `retryCount < MAX_RETRIES`
-2. 若可重试：将数据库状态设回 `QUEUED`，`retryCount + 1`，等待退避延迟后重新入队
-3. 退避等待后再次检查数据库状态（防止等待期间被取消），若仍为 `QUEUED` 则推入队列重新调度
-4. 若已达上限：标记 `FAILED`，记录 `completedAt`
-
-## 状态流转图
+### 重试流程
 
 ```
-PENDING ──enqueue──→ QUEUED ──worker启动──→ PROCESSING
-                       ↑                      │
-                       │ retryCount < N       ├─成功──→ COMPLETED
-                       │ + 退避等待            │
-                       └──────────────────────┤
-                                              ├─失败且retryCount ≥ N──→ FAILED
-                                              │
-                    ┌──── cancel ──────────────┤
-                    ↓                         ↓
-                 CANCELLED                 CANCELLED
-              (QUEUED时取消)          (PROCESSING时取消)
+_executeTask 抛出异常
+  │
+  ├─ 检查 cancelledSet / signal.aborted → 是 → 直接退出，不重试
+  │
+  ├─ 从 DB 读取 task.retryCount
+  │
+  ├─ retryCount < MAX_RETRIES ?
+  │    ├─ 是：
+  │    │    1. DB 更新 status=QUEUED, retryCount+1
+  │    │    2. _sleep(退避延迟, signal)  ← 退避期间仍可被取消
+  │    │    3. 再次检查 cancelledSet / signal.aborted
+  │    │    4. 从 DB 重读状态，确认仍为 QUEUED 且未在 cancelledSet
+  │    │    5. 推回 queue[]，调用 _schedule()
+  │    │
+  │    └─ 否：
+  │         DB 更新 status=FAILED, completedAt=now
+  │
+  └─ finally: 从 abortControllers 中移除
+```
 
-PENDING ──cancel──→ CANCELLED
+## 4. 状态流转图
+
+```
+PENDING ──── enqueue() ────→ QUEUED ──── worker启动 ────→ PROCESSING
+  │                            ↑                          │  │  │
+  │                            │                          │  │  └── 成功 → COMPLETED
+  │                            │                          │  │
+  │                            │  retryCount < N          │  └── 失败 → (重试循环)
+  │                            │  + 退避等待 ─────────────┘
+  │                            │
+  │                            └── retryCount ≥ N → FAILED
+  │
+  └── cancel() → CANCELLED
+
+QUEUED ─────── cancel() ──────→ CANCELLED  (从 queue[] 移除 + DB 更新)
+PROCESSING ─── cancel() ──────→ CANCELLED  (AbortController.abort() + DB 更新)
 ```
 
 ### 状态说明
 
-| 状态 | 含义 |
-|------|------|
-| PENDING | 已创建，等待入队 |
-| QUEUED | 已入队，等待/重试等待中 |
-| PROCESSING | worker 正在执行 |
-| COMPLETED | 执行成功 |
-| FAILED | 重试耗尽后仍失败 |
-| CANCELLED | 被用户主动取消 |
+| 状态 | 含义 | 可流转至 |
+|------|------|---------|
+| PENDING | 已创建，等待入队 | QUEUED, CANCELLED |
+| QUEUED | 已入队，等待 worker 或重试等待中 | PROCESSING, CANCELLED |
+| PROCESSING | worker 正在执行 | COMPLETED, FAILED, QUEUED(重试), CANCELLED |
+| COMPLETED | 执行成功（终态） | — |
+| FAILED | 重试耗尽后仍失败（终态） | — |
+| CANCELLED | 被用户主动取消（终态） | — |
 
-## 前端轮询优化
+## 5. 前端对齐
 
-- 有 PROCESSING/QUEUED 任务时轮询间隔缩短为 1.5s
-- 无活跃任务时恢复 3s 默认间隔
-- 使用递归 `setTimeout` 替代 `setInterval`，每次请求完成后才设定下次定时器，避免请求堆积
+- **轮询**：有 PROCESSING/QUEUED 任务时 1.5s 间隔，否则 3s；递归 setTimeout 避免请求堆积
+- **看板**：新增 CANCELLED 列；QUEUED/PROCESSING 任务卡片带 ✕ 取消按钮；进度条显示百分比；重试中任务显示重试次数 badge
+- **API**：`POST /api/tasks/:id/cancel`；`GET /api/health` 返回 `{ queue: { queued, active, concurrency, maxRetries } }`
