@@ -6,7 +6,9 @@
         <router-link to="/">看板</router-link>
         <router-link to="/create">创建任务</router-link>
         <router-link to="/statistics">统计</router-link>
-        <span>{{ store.currentUser.username }} ({{ store.currentUser.role }})</span>
+        <span
+          >{{ store.currentUser.username }} ({{ store.currentUser.role }})</span
+        >
       </div>
     </nav>
     <div class="container">
@@ -16,18 +18,18 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted } from 'vue'
-import { useStore } from './store'
+import { onMounted, onUnmounted } from "vue";
+import { useStore } from "./store";
 
-const store = useStore()
-let pollInterval: number
+const store = useStore();
+let stopPolling: (() => void) | null = null;
 
 onMounted(async () => {
-  await store.fetchAll()
-  pollInterval = store.startPolling()
-})
+  await store.fetchAll();
+  stopPolling = store.startPolling();
+});
 
 onUnmounted(() => {
-  if (pollInterval) clearInterval(pollInterval)
-})
+  if (stopPolling) stopPolling();
+});
 </script>

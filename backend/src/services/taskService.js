@@ -1,7 +1,7 @@
-const prisma = require('../shared/prisma');
-const { enqueueTask } = require('../queues/taskQueue');
-const { createAuditLog } = require('./auditLogService');
-const { serializeTasks, serializeTask } = require('../helpers/serializer');
+const prisma = require("../shared/prisma");
+const { enqueueTask, cancelTask } = require("../queues/taskQueue");
+const { createAuditLog } = require("./auditLogService");
+const { serializeTasks, serializeTask } = require("../helpers/serializer");
 
 async function createTasks(modelIds, skuIds, scenes, cameraAngles, lightings) {
   const tasks = [];
@@ -16,7 +16,7 @@ async function createTasks(modelIds, skuIds, scenes, cameraAngles, lightings) {
               scene,
               cameraAngle,
               lighting,
-              status: 'PENDING',
+              status: "PENDING",
               originalImageUrl: `https://picsum.photos/seed/orig${Date.now()}${tasks.length}/800/1000`,
             });
           }
@@ -26,31 +26,88 @@ async function createTasks(modelIds, skuIds, scenes, cameraAngles, lightings) {
   }
 
   const createdTasks = await prisma.$transaction(
-    tasks.map(task => prisma.task.create({ data: task }))
+    tasks.map((task) => prisma.task.create({ data: task })),
   );
 
-  await createAuditLog(1, 'CREATE_TASKS', `Created ${createdTasks.length} tasks`);
+  await createAuditLog(
+    1,
+    "CREATE_TASKS",
+    `Created ${createdTasks.length} tasks`,
+  );
 
   return createdTasks;
 }
 
 async function enqueueTasks(taskIds) {
+  // Only re-enqueue tasks that are in a re-queueable state.
+  const updatable = await prisma.task.findMany({
+    where: {
+      id: { in: taskIds },
+      status: { in: ["PENDING", "FAILED", "CANCELLED"] },
+    },
+    select: { id: true },
+  });
+  const ids = updatable.map((t) => t.id);
+
+  if (ids.length > 0) {
+    await prisma.task.updateMany({
+      where: { id: { in: ids } },
+      data: {
+        status: "QUEUED",
+        queuedAt: new Date(),
+        progress: 0,
+        resultImageUrl: null,
+        startedAt: null,
+        completedAt: null,
+      },
+    });
+    ids.forEach((id) => enqueueTask(id));
+  }
+
+  await createAuditLog(1, "ENQUEUE_TASKS", `Enqueued ${ids.length} tasks`);
+
+  return {
+    success: true,
+    queued: ids.length,
+    skipped: taskIds.length - ids.length,
+  };
+}
+
+async function cancelTasks(taskIds) {
+  // Skip tasks that already finished
+  const cancellable = await prisma.task.findMany({
+    where: {
+      id: { in: taskIds },
+      status: { in: ["PENDING", "QUEUED", "PROCESSING"] },
+    },
+    select: { id: true },
+  });
+  const ids = cancellable.map((t) => t.id);
+
+  // Ask the in-process queue to stop them; the queue itself updates DB
+  // for QUEUED / PROCESSING states. We still mark PENDING ones explicitly
+  // so any never-enqueued task is also cancelled.
+  await Promise.all(ids.map((id) => cancelTask(id)));
+
+  // For any PENDING task that was never sent to the queue, ensure DB is updated.
   await prisma.task.updateMany({
-    where: { id: { in: taskIds }, status: 'PENDING' },
-    data: { status: 'QUEUED', queuedAt: new Date() },
+    where: { id: { in: ids }, status: { in: ["PENDING", "QUEUED"] } },
+    data: { status: "CANCELLED" },
   });
 
-  taskIds.forEach(id => enqueueTask(id));
+  await createAuditLog(1, "CANCEL_TASKS", `Cancelled ${ids.length} tasks`);
 
-  await createAuditLog(1, 'ENQUEUE_TASKS', `Enqueued ${taskIds.length} tasks`);
-
-  return { success: true, queued: taskIds.length };
+  return {
+    success: true,
+    cancelled: ids.length,
+    skipped: taskIds.length - ids.length,
+  };
 }
 
 async function getAllTasks() {
   const tasks = await prisma.task.findMany({
     include: { model: true, sku: true, reviews: true },
-    orderBy: { createdAt: 'desc' },
+    orderBy: { createdAt: "desc" },
   });
   return serializeTasks(tasks);
 }
@@ -70,13 +127,14 @@ async function getReshootCandidates(taskId) {
   return prisma.reshootCandidate.findMany({
     where: { parentTaskId: taskId },
     include: { task: true },
-    orderBy: { createdAt: 'asc' },
+    orderBy: { createdAt: "asc" },
   });
 }
 
 module.exports = {
   createTasks,
   enqueueTasks,
+  cancelTasks,
   getAllTasks,
   getTaskById,
   getReshootCandidates,
